@@ -100,8 +100,9 @@ class CrazyflieController:
         Apply thrust forces at the four rotors.
         """
         pos, orn = p.getBasePositionAndOrientation(self.cf_id)
-        # print(cur_traj[6:10])
+        #print("curr traj 6-10", cur_traj[6:10])
         quat = cur_traj[6:10]
+        print("cur_traj", cur_traj)
         des_quat = [quat[1], quat[2], quat[3], quat[0]]
         # print(des_quat)
         quat_norm_sq = des_quat[0]*des_quat[0] + des_quat[1]*des_quat[1] + des_quat[2]*des_quat[2] + des_quat[3]*des_quat[3]
@@ -111,8 +112,10 @@ class CrazyflieController:
         des_quat[1] = des_quat[1] / quat_norm
         des_quat[2] = des_quat[2] / quat_norm
         des_quat[3] = des_quat[3] / quat_norm
-        # print("After normalizing", des_quat)
+
+        print("After normalizing", des_quat)
         R_meas = self.quaternion2rotation_matrix(des_quat)
+        #R_meas = self.quaternion2rotation_matrix(orn)
 
         orn = np.array(orn)
         quat_norm_sq_orn = orn[0]*orn[0] + orn[1]*orn[1] + orn[2]*orn[2] + orn[3]*orn[3]
@@ -126,7 +129,7 @@ class CrazyflieController:
 
         # print("Motor Forces in body frame: ", motor_forces)
         motor_forces = np.array([f_i * R_meas[:,2] for f_i in motor_forces])
-        # print("Forces applied at each motor: ",  motor_forces)
+        print("Forces applied at each motor: ",  motor_forces)
 
         p.applyExternalForce(self.cf_id,-1,motor_forces[0],[self.arm_length/math.sqrt(2), self.arm_length/math.sqrt(2),0.], p.LINK_FRAME)
         p.applyExternalForce(self.cf_id,-1,motor_forces[1],[self.arm_length/math.sqrt(2), -self.arm_length/math.sqrt(2),0.], p.LINK_FRAME)
@@ -175,18 +178,163 @@ class CrazyflieController:
 # Your implementation of the MPC class start here!! 
 class MPC:
     """ MPC for the drone"""
-    def __init__(self):
-    
-    def solve(self, step, current_state):
+    def __init__(self, target_height):
+        # TUNABLE PARAMS
+        self.dt = 0.1 # (s)
+        self.N = 10
+        self.T = self.N * self.dt # Horizon [s]
 
+        # Trajectory
+        params = {
+            't' : [0, 10],
+            'q' : [[0, 0, 0], [1, 1, target_height]],
+            'v' : [[0, 0, 0], [0, 0, 0]],
+            'a' : [[0, 0, 0], [0, 0, 0]],
+            'dt': self.dt
+        }
+
+        #build reference trajectory
+        traj = self.make_trajectory('quintic', params)
+        self.sim_steps = len(traj['t'])-1
+        q_w = np.concat([np.ones((self.sim_steps+1,1)), np.zeros((self.sim_steps+1,6))],axis=1) # hold quat and angular still
+        self.trajectory1 = np.concat([traj['q'], traj['v'], q_w], axis=1)
+
+        # Logging for plots
+        self.simX1 = np.zeros_like(self.trajectory1)
+        #print("Shape of simX1", self.simX1.shape)
+        # Acaodos
+        self.ocp = self.create_ocp()
+        self.ocp_solver = AcadosOcpSolver(self.ocp)
+
+    def solve(self, step, current_state):
+        self.ocp_solver.constraints_set(0, 'lbx', current_state)
+        self.ocp_solver.constraints_set(0, 'ubx', current_state)
+        self.ocp_solver.set(0, 'x', current_state)
+
+        # Build refernces for the horizon steps
+        traj = self.trajectory1
+        traj_len = traj.shape[0] - 1
+        #print("traj len", traj_len)
+        for k in range(self.N):
+            idx = min(step + k + 1, traj_len - 1)
+            q = traj[idx, 0:3]
+            v = traj[idx, 3:6]
+            qw,qx,qy,qz = traj[idx, 6:10]
+            w = traj[idx, 10:13]        # p,q,r  (often zeros in your build)   # desired quaternion
+            yaw = math.atan2(2*(qw*qz + qx*qy), 1 - 2*(qy*qy + qz*qz))
+
+            yref = np.zeros(14)
+            yref[0:3]  = q
+            yref[3:6]  = v
+            yref[6]    = yaw
+            yref[7:10] = w 
+            self.ocp_solver.cost_set(k, "yref", yref)
+
+
+        # Terminal Costs
+        idx_T = min(step + self.N, traj_len)      
+        r_T   = traj[idx_T, 0:3]
+        v_T   = traj[idx_T, 3:6]
+        qw,qx,qy,qz = traj[idx_T, 6:10]
+        yaw_T = math.atan2(2*(qw*qz + qx*qy), 1 - 2*(qy*qy + qz*qz))
+
+        yref_T = np.zeros(7)
+        yref_T[0:3] = r_T
+        yref_T[3:6] = v_T
+        yref_T[6]   = yaw_T
+
+        self.ocp_solver.cost_set(self.N, "yref", yref_T)
+
+        status = self.ocp_solver.solve()
+        if status != 0:
+            print("Solve Status from acados: ", status)
+
+        u0 = self.ocp_solver.get(0, "u") # return first control values
         return {
-            'thrust': ,
-            'moment_x': ,
-            'moment_y': , 
-            'moment_z': 
+            'thrust': float(u0[0]),
+            'moment_x': float(u0[1]),
+            'moment_y': float(u0[2]), 
+            'moment_z': float(u0[3])
         }
     
     def create_ocp(self):         
+        ocp = AcadosOcp()
+        model = quadrotor_model_auto()
+        ocp.model = model
+
+        # --- TUNABLE-PARAMS ---
+        w_pos = 10 # was 10
+        w_vel = 0 # was 2.0
+        w_yaw = 0 # was 4.0
+        w_omega = 0.5
+        w_u=1e-3 # minimize chatter
+
+        nx = model.x.size()[0]
+        #nu = model.u.size()[0]
+
+        # --- Dynamics Model ---
+        x = model.x
+        u = model.u
+
+        r = x[0:3]
+        v = x[3:6]
+        q = x[6:10]
+        w = x[10:13]
+
+        qw, qx, qy, qz = q[0], q[1], q[2], q[3]
+        yaw = np.atan2(2*(qw*qz + qx*qy), 1 - 2*(qy*qy + qz*qz))
+
+        # costs
+        y = ca.vertcat(r, v, yaw, w, u)
+        y_e = ca.vertcat(r, v, yaw)
+
+        W = np.diag([w_pos, w_pos, w_pos,
+                     w_vel, w_vel, w_vel,
+                     w_yaw,
+                     w_omega, w_omega, w_omega,
+                     w_u, w_u, w_u, w_u])
+        
+        W_e = np.diag([w_pos, w_pos, w_pos,
+                       w_vel, w_vel, w_vel,
+                       w_yaw])
+        
+        ocp.cost.yref = np.zeros(W.shape[0])
+        ocp.cost.yref_e = np.zeros(W_e.shape[0])
+
+        # --- Constraints --- (with params from the model)
+        mu = 0.73575                 # max thrust per rotor [N]
+        L  = 0.0397                  # arm length [m]
+        kf = 3.16e-10                # thrust coeff
+        km = 7.94e-12                # moment coeff
+        g  = km / kf                 
+
+        u1_min, u1_max   = 0.0, 4.0*mu                 # total thrust
+        tau_xy_max       = np.sqrt(2.0) * L * mu       # roll/pitch torque bound
+        tau_z_max        = 2.0 * g * mu 
+
+        ocp.constraints.lbu   = np.array([u1_min, -tau_xy_max, -tau_xy_max, -tau_z_max])
+        ocp.constraints.ubu   = np.array([u1_max,  tau_xy_max,  tau_xy_max,  tau_z_max])
+        ocp.constraints.idxbu = np.array([0, 1, 2, 3])
+
+        ocp.constraints.x0 = np.zeros(nx) # Default values overwrite with solve()
+
+        # --- Solver / Integrator Options ---
+        ocp.cost.W = W
+        ocp.cost.W_e = W_e
+        ocp.cost.cost_type = "NONLINEAR_LS"
+        ocp.cost.cost_type_e = "NONLINEAR_LS"
+        ocp.model.cost_y_expr = y
+        ocp.model.cost_y_expr_e = y_e
+
+        ocp.dims.N = self.N # [10, 20]
+        ocp.solver_options.tf = self.N * self.dt # (s) [0.05, 0.10]
+        ocp.solver_options.integrator_type = "ERK" # = "RK4"
+        ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
+        ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM"
+        ocp.solver_options.nlp_solver_type = "SQP_RTI"
+        ocp.solver_options.sim_method_num_stages = 4
+        ocp.solver_options.sim_method_num_steps  = 3
+        ocp.solver_options.qp_solver_cond_N = 0
 
         return ocp
 
@@ -272,7 +420,7 @@ class MPC:
 if __name__ == "__main__":
     # Initialize controller and MPC
     cf_controller = CrazyflieController()
-    mpc = MPC(target_height=0.5)
+    mpc = MPC(target_height=1)#0.5)
     
     # Simulation loop
     for step in range(mpc.sim_steps):
@@ -283,7 +431,7 @@ if __name__ == "__main__":
         mpc_output = mpc.solve(step, current_state)
 
         # Apply control and step simulation
-        new_state = cf_controller.step_simulation(mpc_output, mpc.trajectory1[step+1])
+        new_state = cf_controller.step_simulation(mpc_output, mpc.trajectory1[step+1])#[:][step+1])
         
         # Print state every 100 steps
         if step % 100 == 0:
@@ -304,6 +452,7 @@ if __name__ == "__main__":
     r_safe = r_obs + margin
 
     # Plot all 3 x, y, and z on a 3D plot
+    #plt.ion()  # interactive mode ON
     fig = plt.figure()
     ax = fig.add_subplot(111, projection='3d')
 
@@ -324,7 +473,7 @@ if __name__ == "__main__":
         line1.set_data(mpc.simX1[:t+1, 0], mpc.simX1[:t+1, 1])
         line1.set_3d_properties(mpc.simX1[:t+1, 2])
         plt.draw()
-        plt.pause(0.01)  # adjust speed
+        plt.pause(0.05)  # adjust speed
 
     ax.legend()
     ax.grid(True)
