@@ -9,6 +9,13 @@ from quadrotor_model import quadrotor_model_auto
 import casadi as ca
 import matplotlib.pyplot as plt
 
+# Quick Generic Helpers for some logging stuff
+def yaw_from_quat_np(qw, qx, qy, qz):
+    return math.atan2(2*(qw*qz + qx*qy), 1 - 2*(qy*qy + qz*qz))
+
+def wrap_pi(a):
+    return (a + np.pi) % (2*np.pi) - np.pi
+
 class CrazyflieController:
     def __init__(self, urdf_path="./cf2x.urdf"):
         # Physical parameters from URDF
@@ -102,7 +109,7 @@ class CrazyflieController:
         pos, orn = p.getBasePositionAndOrientation(self.cf_id)
         #print("curr traj 6-10", cur_traj[6:10])
         quat = cur_traj[6:10]
-        print("cur_traj", cur_traj)
+        #print("cur_traj", cur_traj)
         des_quat = [quat[1], quat[2], quat[3], quat[0]]
         # print(des_quat)
         quat_norm_sq = des_quat[0]*des_quat[0] + des_quat[1]*des_quat[1] + des_quat[2]*des_quat[2] + des_quat[3]*des_quat[3]
@@ -113,7 +120,7 @@ class CrazyflieController:
         des_quat[2] = des_quat[2] / quat_norm
         des_quat[3] = des_quat[3] / quat_norm
 
-        print("After normalizing", des_quat)
+        #print("After normalizing", des_quat)
         R_meas = self.quaternion2rotation_matrix(des_quat)
         #R_meas = self.quaternion2rotation_matrix(orn)
 
@@ -129,7 +136,7 @@ class CrazyflieController:
 
         # print("Motor Forces in body frame: ", motor_forces)
         motor_forces = np.array([f_i * R_meas[:,2] for f_i in motor_forces])
-        print("Forces applied at each motor: ",  motor_forces)
+        #print("Forces applied at each motor: ",  motor_forces)
 
         p.applyExternalForce(self.cf_id,-1,motor_forces[0],[self.arm_length/math.sqrt(2), self.arm_length/math.sqrt(2),0.], p.LINK_FRAME)
         p.applyExternalForce(self.cf_id,-1,motor_forces[1],[self.arm_length/math.sqrt(2), -self.arm_length/math.sqrt(2),0.], p.LINK_FRAME)
@@ -201,6 +208,19 @@ class MPC:
 
         # Logging for plots
         self.simX1 = np.zeros_like(self.trajectory1)
+
+        Nsim = self.sim_steps + 1
+        self.log = {
+            "t":        np.arange(Nsim) * self.dt,
+            "r_ref":    np.zeros((Nsim, 3)),
+            "r_meas":   np.zeros((Nsim, 3)),
+            "yaw_ref":  np.zeros((Nsim, )),
+            "yaw_meas": np.zeros((Nsim, )),
+            "u":        np.zeros((Nsim, 4)),   # [thrust, tau_x, tau_y, tau_z]
+            "e_r":      np.zeros((Nsim, 3)),
+            "e_yaw":    np.zeros((Nsim, )),
+        }
+
         #print("Shape of simX1", self.simX1.shape)
         # Acaodos
         self.ocp = self.create_ocp()
@@ -263,11 +283,11 @@ class MPC:
         ocp.model = model
 
         # --- TUNABLE-PARAMS ---
-        w_pos = 10 # was 10
-        w_vel = 0 # was 2.0
-        w_yaw = 0 # was 4.0
+        w_pos = 20 # was 10
+        w_vel = 2 # was 2.0
+        w_yaw = 4 # was 4.0
         w_omega = 0.5
-        w_u=1e-3 # minimize chatter
+        w_u=1e-3 # minimize chatter (some small number)
 
         nx = model.x.size()[0]
         #nu = model.u.size()[0]
@@ -426,13 +446,38 @@ if __name__ == "__main__":
     for step in range(mpc.sim_steps):
         # Get current state
         current_state = cf_controller.get_state()
+
+        # Logging
+        r_meas = current_state['position']
+        v_meas = current_state['velocity']
+        q_meas = current_state['orientation']
+        yaw_meas = yaw_from_quat_np(*q_meas)
+
         current_state = np.concatenate([current_state['position'].ravel(), current_state['velocity'].ravel(), current_state['orientation'].ravel(), current_state['angular_velocity'].ravel()])
         
+        # Logging
+        idx_ref = min(step+1, mpc.trajectory1.shape[0]-1)
+        r_ref = mpc.trajectory1[idx_ref, 0:3]
+        qw,qx,qy,qz = mpc.trajectory1[idx_ref, 6:10]
+        yaw_ref = yaw_from_quat_np(qw,qx,qy,qz)
+
         mpc_output = mpc.solve(step, current_state)
 
         # Apply control and step simulation
         new_state = cf_controller.step_simulation(mpc_output, mpc.trajectory1[step+1])#[:][step+1])
         
+        u_vec = np.array([mpc_output['thrust'], mpc_output['moment_x'], mpc_output['moment_y'], mpc_output['moment_z']])
+        
+        # Logging
+        mpc.log["r_ref"][step, :]   = r_ref
+        mpc.log["r_meas"][step, :]  = r_meas
+        mpc.log["yaw_ref"][step]    = yaw_ref
+        mpc.log["yaw_meas"][step]   = yaw_meas
+        mpc.log["u"][step, :]       = u_vec
+
+        mpc.log["e_r"][step, :]   = r_meas - r_ref
+        mpc.log["e_yaw"][step]    = wrap_pi(yaw_meas - yaw_ref)
+
         # Print state every 100 steps
         if step % 100 == 0:
             print(f"Step {step}: Height = {new_state['position'][2]:.3f}m")
@@ -441,6 +486,20 @@ if __name__ == "__main__":
     current_state = np.concatenate([current_state['position'].ravel(), current_state['orientation'].ravel(), current_state['velocity'].ravel(), current_state['angular_velocity'].ravel()])
 
     mpc.simX1[step,:] = current_state
+
+    # Logging
+    last = mpc.sim_steps
+    mpc.log["r_ref"][last,:]  = mpc.trajectory1[min(last, mpc.trajectory1.shape[0]-1), 0:3]
+    qw,qx,qy,qz = mpc.trajectory1[min(last, mpc.trajectory1.shape[0]-1), 6:10]
+    mpc.log["yaw_ref"][last]  = yaw_from_quat_np(qw,qx,qy,qz)
+
+    s = cf_controller.get_state()
+    mpc.log["r_meas"][last,:]  = s['position']
+    mpc.log["yaw_meas"][last]  = yaw_from_quat_np(*s['orientation'])
+
+    mpc.log["e_r"][last,:]   = mpc.log["r_meas"][last,:] - mpc.log["r_ref"][last,:]
+    mpc.log["e_yaw"][last]   = wrap_pi(mpc.log["yaw_meas"][last] - mpc.log["yaw_ref"][last])
+
     
     # Plotting obstacles and drone trajectories on a 3D plot
     traj_plot1 = mpc.trajectory1[:mpc.sim_steps+1, :3]
@@ -468,16 +527,85 @@ if __name__ == "__main__":
     ## Uncomment below for animation of drone trajectories
     line1, = ax.plot([], [], [], 'b', label='Drone 1')
 
-    # Animation loop
+    # Animation loop (Couldn't get this to work)
     for t in range(len(mpc.simX1)):
         line1.set_data(mpc.simX1[:t+1, 0], mpc.simX1[:t+1, 1])
         line1.set_3d_properties(mpc.simX1[:t+1, 2])
         plt.draw()
-        plt.pause(0.05)  # adjust speed
+        plt.pause(0.02)  # adjust speed
 
     ax.legend()
     ax.grid(True)
 
+    # Lots of Plots
+    T = mpc.log["t"]
+    def _trim(a):
+        n = len(T)
+        return a[:n] if a.shape[0] >= n else np.pad(a, ((0, n-a.shape[0]),) + ((0,0),)*(a.ndim-1))
+
+    r_ref   = _trim(mpc.log["r_ref"])
+    r_meas  = _trim(mpc.log["r_meas"])
+    yaw_ref = mpc.log["yaw_ref"][:len(T)]
+    yaw_meas= mpc.log["yaw_meas"][:len(T)]
+    u_log   = _trim(mpc.log["u"])
+    e_r     = _trim(mpc.log["e_r"])
+    e_yaw   = mpc.log["e_yaw"][:len(T)]
+
+    # Trajectory Position tracking
+    fig1, axs = plt.subplots(3, 1, figsize=(9, 8), sharex=True)
+    axes_labels = ['X [m]', 'Y [m]', 'Z [m]']
+    for i, ax in enumerate(axs):
+        ax.plot(T, r_ref[:, i], '--', label=f'{axes_labels[i]} ref')
+        ax.plot(T, r_meas[:, i], label=f'{axes_labels[i]} meas')
+        ax.set_ylabel(axes_labels[i])
+        ax.grid(True, linestyle='--', alpha=0.5)
+        ax.legend(loc='best')
+    axs[-1].set_xlabel('Time [s]')
+    fig1.suptitle('Position Tracking (r)')
+    fig1.tight_layout(rect=[0, 0.03, 1, 0.97])
+
+    # Yaw tracking
+    fig2, ax2 = plt.subplots(1, 1, figsize=(9, 3.2))
+    ax2.plot(T, yaw_ref, '--', label='Yaw ref')
+    ax2.plot(T, yaw_meas, label='Yaw meas')
+    ax2.set_title('Yaw Tracking (ψ)')
+    ax2.set_xlabel('Time [s]')
+    ax2.set_ylabel('Yaw [rad]')
+    ax2.grid(True, linestyle='--', alpha=0.5)
+    ax2.legend(loc='best')
+    fig2.tight_layout()
+
+    # Position & yaw errors 
+    fig3, axs3 = plt.subplots(2, 1, figsize=(9, 6.2), sharex=True)
+    axs3[0].plot(T, e_r[:,0], label='e_x')
+    axs3[0].plot(T, e_r[:,1], label='e_y')
+    axs3[0].plot(T, e_r[:,2], label='e_z')
+    axs3[0].set_title('Position Error')
+    axs3[0].set_ylabel('Error [m]')
+    axs3[0].grid(True, linestyle='--', alpha=0.5)
+    axs3[0].legend(loc='best')
+
+    axs3[1].plot(T, e_yaw, label='e_yaw')
+    axs3[1].set_title('Yaw Error')
+    axs3[1].set_xlabel('Time [s]')
+    axs3[1].set_ylabel('Error [rad]')
+    axs3[1].grid(True, linestyle='--', alpha=0.5)
+    axs3[1].legend(loc='best')
+     
+    fig3.tight_layout()
+ 
+    # Control inputs
+    fig4, ax4 = plt.subplots(1, 1, figsize=(9, 4.2))
+    ax4.plot(T, u_log[:,0], label='u1 (thrust) [N]')
+    ax4.plot(T, u_log[:,1], label='τx [N·m]')
+    ax4.plot(T, u_log[:,2], label='τy [N·m]')
+    ax4.plot(T, u_log[:,3], label='τz [N·m]')
+    ax4.set_title('Control Inputs u')
+    ax4.set_xlabel('Time [s]')
+    ax4.set_ylabel('Magnitude')
+    ax4.grid(True, linestyle='--', alpha=0.5)
+    ax4.legend(loc='best')
+    fig4.tight_layout()
+
     plt.show()
-    
     p.disconnect()
