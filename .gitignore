@@ -1,2 +1,14 @@
-c_generated_code/
+# OS
 .DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Acados generated files
+c_generated_code/
+acados_ocp.json
+
+# Archives
+Archive.zip
+archive.zip
